@@ -6,8 +6,10 @@ import { AnalysisRequestBody, Timespan } from '../types/market';
 import { normalizeJournalSymbol } from '../utils/symbol-mapper';
 import prisma from '../services/prisma';
 import { getOrCreateDemoUserId } from '../services/user.service';
-import { summarizeIndicators } from '../utils/indicators';
+import { summarizeIndicators, getIndicatorsSnapshot } from '../utils/indicators';
+import { coerceTextToV2 } from '../utils/ai-postprocess';
 import newsService from '../services/news.service';
+import { getPersonalizationWeights, makePhraseNormalizer, truncateContext } from '../config/personalization';
 
 const MAX_RANGE_DAYS: Record<Timespan, number> = {
   minute: 7,
@@ -195,11 +197,26 @@ export class TradingController extends BaseController {
       news = digest;
     } catch {}
 
+    // Обогащаем сделки индикаторами на момент entry/exit
+    const trades = Array.isArray(body.trades) ? body.trades : [];
+    const enrichedTrades = trades.map((t: any) => {
+      try {
+        const sym = t?.symbol ? normalizeJournalSymbol(String(t.symbol)) : undefined;
+        const candles = sym ? candlesBySymbol[sym] : undefined;
+        if (candles && candles.length) {
+          const entryTime = t?.entryTime || t?.timestamp || t?.time;
+          const exitTime = t?.exitTime;
+          const snapshot = getIndicatorsSnapshot(candles, entryTime, exitTime);
+          return { ...t, indicators: snapshot };
+        }
+      } catch {}
+      return { ...t };
+    });
+
     // Формируем marketConditions для Gemini: свечи + агрегаты индикаторов + новости
     const marketConditions = { timespan, from, to, candles: candlesBySymbol, marketIndicators: indicatorsBySymbol, news };
 
-    // Подготовим trades (если пришли) в свободной форме для промпта
-    const trades = body.trades || [];
+    // Подготовим trades (обогащённые) для промпта
     // Если пришёл ровно один trade с id — сохраним связь в AIAnalysis.tradeId
     let singleTradeId: string | null = null;
     try {
@@ -215,19 +232,133 @@ export class TradingController extends BaseController {
     const acceptLang = (req.headers['accept-language'] || '').toString().toLowerCase();
     const lang: 'ru' | 'en' = bodyLang === 'en' ? 'en' : bodyLang === 'ru' ? 'ru' : (acceptLang.startsWith('en') ? 'en' : 'ru');
 
+    // Версия схемы ответа AI
+    const schema: 'v1' | 'v2' = ((): 'v1' | 'v2' => {
+      const s = (req.body?.schema || '').toString().toLowerCase();
+      return s === 'v1' ? 'v1' : 'v2';
+    })();
+
+    // Персонализация: короткая статистика повторяющихся ошибок за последние N дней (с весами)
+    const historyDays = Number(req.body?.historyDays || 14);
+    let personalContext: string | undefined = undefined;
+    try {
+      const userId = await getOrCreateDemoUserId();
+      const since = new Date(Date.now() - Math.max(1, historyDays) * 24 * 60 * 60 * 1000);
+      const recent = await prisma.aIAnalysis.findMany({
+        where: { userId, createdAt: { gte: since } },
+        select: { response: true },
+        take: 200,
+        orderBy: { createdAt: 'desc' },
+      });
+      // Подготовим веса по текущим символам и направлению сделок
+      const W = getPersonalizationWeights();
+      const currentSymbols = new Set<string>((body.symbols || []).map((s: string) => normalizeJournalSymbol(String(s))));
+      const currentDir = (() => {
+        const dirs = (enrichedTrades || []).map((t: any) => String(t?.direction || '').toLowerCase());
+        return {
+          hasLong: dirs.some((d) => d.includes('buy') || d.includes('long') || d.includes('покуп')),
+          hasShort: dirs.some((d) => d.includes('sell') || d.includes('short') || d.includes('продаж')),
+        };
+      })();
+
+      // Нормализатор синонимов -> канонические кластеры
+      const normalizePhrase = makePhraseNormalizer();
+
+      // Общие частоты и частоты по символам
+      const freq: Record<string, number> = {};
+      const perSymbol: Record<string, Record<string, number>> = {};
+      const add = (s: string, weight: number) => {
+        const key = normalizePhrase(s);
+        if (!key) return;
+        freq[key] = (freq[key] || 0) + weight;
+      };
+      const addPerSymbol = (symbol: string, s: string, weight: number) => {
+        const key = normalizePhrase(s);
+        if (!key) return;
+        if (!perSymbol[symbol]) perSymbol[symbol] = {};
+        perSymbol[symbol][key] = (perSymbol[symbol][key] || 0) + weight;
+      };
+
+      for (const r of recent) {
+        try {
+          const obj = JSON.parse(String(r.response || '{}'));
+          const ai = obj?.ai || obj;
+          const fullText = JSON.stringify(ai || {}).toLowerCase();
+
+          // Валидность V2 повышает базовый вес
+          let baseWeight = W.baseOther;
+          const isV2 = typeof ai?.summary === 'string' && typeof ai?.marketContext === 'string' && typeof ai?.tradeAnalysis === 'string' && typeof ai?.psychology === 'string';
+          if (isV2) baseWeight = W.baseV2;
+
+          // Символьный вес: если среди текущих символов есть упоминание в тексте — умножаем на 1, иначе 0.5
+          let symbolWeight = W.symbolOther;
+          let matchedSymbols: string[] = [];
+          for (const s of currentSymbols) {
+            if (s && fullText.includes(s.toLowerCase())) { symbolWeight = W.symbolMatch; matchedSymbols.push(s); }
+          }
+
+          // Вес по направлению: если текущий запрос преимущественно long/short и это упомянуто в тексте — усиливаем
+          let dirWeight = 1.0;
+          if (currentDir.hasLong && /long|buy|покупк/.test(fullText)) dirWeight *= W.dirMatchBoost;
+          if (currentDir.hasShort && /short|sell|продаж/.test(fullText)) dirWeight *= W.dirMatchBoost;
+
+          const weight = baseWeight * symbolWeight * dirWeight;
+
+          const weaknesses: string[] = Array.isArray(ai?.weaknesses) ? ai.weaknesses : [];
+          const recommendations: string[] = Array.isArray(ai?.recommendations) ? ai.recommendations : [];
+          weaknesses.forEach((w) => {
+            add(w, weight);
+            matchedSymbols.forEach((sym) => addPerSymbol(sym, w, weight));
+          });
+          // Рекомендации учитываем с понижающим коэффициентом, чтобы не размывать сигнал
+          const recW = weight * W.recFactor;
+          recommendations.forEach((s) => {
+            add(`[rec] ${s}`, recW);
+            matchedSymbols.forEach((sym) => addPerSymbol(sym, `[rec] ${s}`, recW));
+          });
+        } catch {}
+      }
+
+      // Формируем многострочный personalContext: топ по символам + общий итог
+      const lines: string[] = [];
+      const symbolList = Array.from(currentSymbols);
+      const maxSym = W.maxSymbolsInContext;
+      for (const sym of symbolList.slice(0, maxSym)) {
+        const dict = perSymbol[sym];
+        if (!dict) continue;
+        const top = Object.entries(dict).sort((a, b) => b[1] - a[1]).slice(0, W.topPatternsPerSymbol);
+        if (!top.length) continue;
+        lines.push(`${sym}: ${top.map(([k, v]) => `${k} — ${v.toFixed(1)}`).join('; ')}`);
+      }
+      const overallTop = Object.entries(freq).sort((a, b) => b[1] - a[1]).slice(0, 3);
+      if (overallTop.length) lines.push(`Итого: ${overallTop.map(([k, v]) => `${k} — ${v.toFixed(1)}`).join('; ')}`);
+      if (lines.length) {
+        const content = `Личный контекст за ${Math.max(1, historyDays)} дней:\n` + lines.join('\n');
+        personalContext = truncateContext(content);
+      }
+    } catch {}
+
     // Вызов Gemini (JSON-приоритет) с безопасным фоллбеком
     let textSummary = '';
     let ai: any | undefined;
     let aiMeta: any | undefined;
     try {
-      const aiResult = await geminiService.analyzeTradingDataJSON(trades as any, marketConditions, lang);
+      const aiResult = await geminiService.analyzeTradingDataJSON(enrichedTrades as any, marketConditions, lang, schema, personalContext);
       if (aiResult?.ai) {
         ai = aiResult.ai;
         textSummary = ai.summary || '';
         aiMeta = aiResult.meta;
       } else if (aiResult?.rawText) {
-        textSummary = aiResult.rawText;
-        aiMeta = aiResult.meta;
+        // Постобработка: конвертируем текст в структуру V2
+        try {
+          const coerced = coerceTextToV2(aiResult.rawText);
+          ai = coerced;
+          textSummary = coerced.summary || aiResult.rawText;
+          aiMeta = { ...(aiResult.meta || {}), schema: 'v2', coerced: true };
+        } catch {
+          textSummary = aiResult.rawText;
+          aiMeta = aiResult.meta;
+        }
       } else {
         textSummary = 'ИИ-анализ временно недоступен. Ниже приведены структурированные данные для ручного разбора.';
       }

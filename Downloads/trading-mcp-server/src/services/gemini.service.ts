@@ -1,7 +1,7 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import config from '../config';
 import logger from '../utils/logger';
-import { validateAiResult, AiAnalysisJSON } from '../utils/ai-schema';
+import { validateAiResult, AiAnalysisJSON, AiAnalysisJSONv2, validateAiResultV2 } from '../utils/ai-schema';
 import { ProxyAgent, setGlobalDispatcher, getGlobalDispatcher, Dispatcher } from 'undici';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 
@@ -144,13 +144,17 @@ class GeminiService {
   public async analyzeTradingDataJSON(
     trades: any[],
     marketConditions: any,
-    lang: 'ru' | 'en' = 'ru'
-  ): Promise<{ ai?: AiAnalysisJSON; rawText?: string; error?: string; meta?: { model?: string; latencyMs?: number; promptChars?: number; responseChars?: number } }> {
+    lang: 'ru' | 'en' = 'ru',
+    schema: 'v1' | 'v2' = 'v2',
+    personalContext?: string
+  ): Promise<{ ai?: any; rawText?: string; error?: string; meta?: { model?: string; latencyMs?: number; promptChars?: number; responseChars?: number; schema?: 'v1'|'v2' } }> {
     if (!this.model) {
       throw new Error('Gemini service is not properly initialized');
     }
 
-    const prompt = this.buildTradingAnalysisJSONPrompt(trades, marketConditions, lang);
+    const prompt = schema === 'v2'
+      ? this.buildTradingAnalysisJSONPromptV2(trades, marketConditions, lang, personalContext)
+      : this.buildTradingAnalysisJSONPrompt(trades, marketConditions);
     const tryOnce = async (p: string, modelInstance: any, modelName: string) => {
       const started = Date.now();
       let prev: Dispatcher | null = null;
@@ -182,12 +186,18 @@ class GeminiService {
       // Первая попытка
       let first = await tryOnce(prompt, this.model, this.modelName || '');
       let text = first.text;
-      let ai: AiAnalysisJSON | undefined;
+      let ai: any | undefined;
       try {
         const parsed = JSON.parse(text);
-        const v = validateAiResult(parsed);
-        if (v.ok) ai = parsed as AiAnalysisJSON;
-        else throw new Error(v.reason);
+        if (schema === 'v2') {
+          const v2 = validateAiResultV2(parsed);
+          if (v2.ok) ai = parsed as AiAnalysisJSONv2;
+          else throw new Error(v2.reason);
+        } else {
+          const v1 = validateAiResult(parsed);
+          if (v1.ok) ai = parsed as AiAnalysisJSON;
+          else throw new Error(v1.reason);
+        }
       } catch (e1) {
         // Репромпт с уточнением — вернуть строго JSON без преамбул
         logger.warn('AI JSON parse failed, retrying with stricter instruction', { reason: String((e1 as any)?.message || e1) });
@@ -196,16 +206,42 @@ class GeminiService {
         text = second.text;
         try {
           const parsed2 = JSON.parse(text);
-          const v2 = validateAiResult(parsed2);
-          if (v2.ok) ai = parsed2 as AiAnalysisJSON;
-          else throw new Error(v2.reason);
+          if (schema === 'v2') {
+            const v2res = validateAiResultV2(parsed2);
+            if (v2res.ok) ai = parsed2 as AiAnalysisJSONv2;
+            else throw new Error(v2res.reason);
+          } else {
+            const v1res = validateAiResult(parsed2);
+            if (v1res.ok) ai = parsed2 as AiAnalysisJSON;
+            else throw new Error(v1res.reason);
+          }
         } catch (e2) {
-          // Возвращаем сырой текст как fallback
-          return { rawText: text, error: String((e2 as any)?.message || e2), meta: { model: this.modelName, latencyMs: first.latencyMs, promptChars: strictPrompt.length, responseChars: text?.length || 0 } };
+          // Попробуем альтернативную схему как второй фоллбек (v2 -> v1 или v1 -> v2)
+          try {
+            const parsedAlt = JSON.parse(text);
+            if (schema === 'v2') {
+              const v1alt = validateAiResult(parsedAlt);
+              if (v1alt.ok) {
+                ai = parsedAlt as AiAnalysisJSON;
+              } else {
+                throw new Error(v1alt.reason);
+              }
+            } else {
+              const v2alt = validateAiResultV2(parsedAlt);
+              if (v2alt.ok) {
+                ai = parsedAlt as AiAnalysisJSONv2;
+              } else {
+                throw new Error(v2alt.reason);
+              }
+            }
+          } catch (e3) {
+            // Возвращаем сырой текст как окончательный fallback
+            return { rawText: text, error: String((e3 as any)?.message || e3), meta: { model: this.modelName, latencyMs: first.latencyMs, promptChars: strictPrompt.length, responseChars: text?.length || 0, schema } };
+          }
         }
       }
 
-      return { ai, meta: { model: this.modelName, latencyMs: first.latencyMs, promptChars: prompt.length, responseChars: text?.length || 0 } };
+      return { ai, meta: { model: this.modelName, latencyMs: first.latencyMs, promptChars: prompt.length, responseChars: text?.length || 0, schema } };
     } catch (error) {
       const msg = String((error as any)?.message || error);
       logger.error('Error analyzing trading data (JSON) with Gemini', { error: msg });
@@ -215,7 +251,7 @@ class GeminiService {
         try {
           logger.warn(`Retrying JSON analysis with fallback Gemini model: ${fallback}`);
           const altModel = this.genAI.getGenerativeModel({ model: fallback });
-          const p = this.buildTradingAnalysisJSONPrompt(trades, marketConditions, lang);
+          const p = schema === 'v2' ? this.buildTradingAnalysisJSONPromptV2(trades, marketConditions, lang, personalContext) : this.buildTradingAnalysisJSONPrompt(trades, marketConditions);
           const altResult = await (async () => {
             const started = Date.now();
             let prev: Dispatcher | null = null;
@@ -244,10 +280,15 @@ class GeminiService {
           const text = altResult.text;
           try {
             const parsed = JSON.parse(text);
-            const v = validateAiResult(parsed);
-            if (v.ok) return { ai: parsed as AiAnalysisJSON, meta: { model: fallback, latencyMs: altResult.latencyMs, promptChars: altResult.promptChars, responseChars: altResult.responseChars } };
+            if (schema === 'v2') {
+              const v2res = validateAiResultV2(parsed);
+              if (v2res.ok) return { ai: parsed as AiAnalysisJSONv2, meta: { model: fallback, latencyMs: altResult.latencyMs, promptChars: altResult.promptChars, responseChars: altResult.responseChars, schema } };
+            } else {
+              const v1res = validateAiResult(parsed);
+              if (v1res.ok) return { ai: parsed as AiAnalysisJSON, meta: { model: fallback, latencyMs: altResult.latencyMs, promptChars: altResult.promptChars, responseChars: altResult.responseChars, schema } };
+            }
           } catch {}
-          return { rawText: text, error: 'invalid_json', meta: { model: fallback, latencyMs: altResult.latencyMs, promptChars: altResult.promptChars, responseChars: altResult.responseChars } };
+          return { rawText: text, error: 'invalid_json', meta: { model: fallback, latencyMs: altResult.latencyMs, promptChars: altResult.promptChars, responseChars: altResult.responseChars, schema } };
         } catch (e2) {
           logger.error('Fallback Gemini model (JSON) also failed', { error: String((e2 as any)?.message || e2) });
         }
@@ -377,9 +418,74 @@ class GeminiService {
 - Опирайся на числа из данных и кратко формулируй пункты.
 - Учитывай влияние новостей на волатильность/направление и возможные ошибки стратегии возле событий.`;
   }
+
+  private buildTradingAnalysisJSONPromptV2(trades: any[], marketConditions: any, lang: 'ru'|'en' = 'ru', personalContext?: string): string {
+    const period = marketConditions?.from && marketConditions?.to && marketConditions?.timespan
+      ? { from: marketConditions.from, to: marketConditions.to, timespan: marketConditions.timespan }
+      : undefined;
+
+    const candles = marketConditions?.candles || {};
+    const symbolSummaries: Record<string, any> = {};
+    try {
+      for (const [sym, arr] of Object.entries<any>(candles)) {
+        const items = Array.isArray(arr) ? arr : [];
+        if (!items.length) { symbolSummaries[sym] = { count: 0 }; continue; }
+        const closes = items.map((c: any) => Number(c?.c)).filter((v: any) => Number.isFinite(v));
+        const highs = items.map((c: any) => Number(c?.h)).filter((v: any) => Number.isFinite(v));
+        const lows  = items.map((c: any) => Number(c?.l)).filter((v: any) => Number.isFinite(v));
+        const first = closes[0];
+        const last = closes[closes.length - 1];
+        const min = Math.min(...lows);
+        const max = Math.max(...highs);
+        const avg = closes.reduce((a: number, b: number) => a + b, 0) / Math.max(1, closes.length);
+        symbolSummaries[sym] = {
+          count: items.length,
+          firstClose: first,
+          lastClose: last,
+          minLow: min,
+          maxHigh: max,
+          avgClose: Number.isFinite(avg) ? Number(avg.toFixed(6)) : undefined,
+        };
+      }
+    } catch {}
+
+    const safeTrades = Array.isArray(trades) ? trades.slice(0, 100) : [];
+    const payload = {
+      trades: safeTrades, // ожидаются enriched trades с полем indicators.entry/exit
+      period,
+      marketSummary: symbolSummaries,
+      marketIndicators: marketConditions?.marketIndicators || {},
+      news: marketConditions?.news || {},
+      personalContext: personalContext || undefined,
+    };
+
+    const langHint = lang === 'ru'
+      ? 'Отвечай на русском языке.'
+      : 'Respond in English.';
+
+    return `Ты — ИИ-ассистент трейдера. Твоя задача — дать детализированный анализ каждой сделки и всего периода. Используй индикаторы на момент входа/выхода (RSI, EMA/SMA, ATR%), новостной фон и рыночные агрегаты.
+${langHint}
+
+Данные (JSON):\n${JSON.stringify(payload, null, 2)}
+
+Верни СТРОГО следующий JSON БЕЗ каких-либо пояснений, без Markdown и без префиксов/суффиксов:
+{
+  "summary": string,
+  "marketContext": string,
+  "tradeAnalysis": string,
+  "psychology": string,
+  "strengths": string[],
+  "weaknesses": string[],
+  "recommendations": string[]
+}
+
+Требования:
+- ТОЛЬКО корректный JSON-объект.
+- Опирайся на числа: RSI/ATR%, позиция цены относительно EMA200, slope EMA200, новости.
+ - Конкретика в рекомендациях (например: стоп X пунктов, избегать торговли во время NFP, входить по подтверждению тренда и т.п.).
+ - Не используй форматирование Markdown и не вставляй блоки кода. Верни ТОЛЬКО сырой JSON-объект.`;
+}
 }
 
 // Экспортируем синглтон
 export default new GeminiService();
-
-
