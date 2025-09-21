@@ -8,6 +8,9 @@ MCP-сервер для приложения Trading Journal. Позволяет
 - Нормализация символов журнала в формат Polygon (EURUSD → C:EURUSD, XAUUSD+ → C:XAUUSD, USOUSD → C:XTIUSD)
 - Ретраи, таймауты, базовый кэш ответов
 - Аутентификация по API-ключу (заголовок `x-api-key`)
+- Обогащение анализа новостями (NewsAPI) с агрегированием по символам и временным диапазонам
+- Локальная БД SQLite через Prisma: CRUD по сделкам, аудит изменений, хранение истории ИИ‑анализов
+- Метрики по сделкам: сводка, PnL по неделям/дням, максимальная просадка
 
 ## Требования
 - Node.js 18+
@@ -30,15 +33,28 @@ npm run build && npm start
 - `API_KEY` — ключ для доступа к API сервера (заголовок `x-api-key`)
 - `POLYGON_API_KEY` — ключ Polygon.io
 - `GEMINI_API_KEY` — ключ Google Gemini (для анализа периода)
+- `GEMINI_MODEL` — модель Gemini (например, `gemini-2.5-flash`)
+- `GEMINI_FALLBACK_MODEL` — запасная модель для деградации
+- `GEMINI_TIMEOUT_MS` — таймаут вызова Gemini, мс
+- `GEMINI_PROXY_URL` — при необходимости прокси только для Gemini (например, `socks5h://127.0.0.1:1080`)
 - `CORS_ORIGIN` — разрешённый источник CORS
 - `DATABASE_URL` — строка подключения Prisma (для SQLite: `file:./prisma/dev.db`)
-- Необязательные настройки Polygon:
+- Настройки Polygon (опционально):
   - `POLYGON_TIMEOUT_MS` (по умолчанию 15000)
   - `POLYGON_MAX_RETRIES` (по умолчанию 3)
   - `POLYGON_BACKOFF_BASE_MS` (по умолчанию 300)
   - `POLYGON_CACHE_TTL_MS` (по умолчанию 600000)
-- Прокси (если используете VPN/корпоративную сеть):
-  - `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`
+  - Переопределение TTL по таймфреймам (опц.): `POLYGON_TTL_MINUTE_MS`, `POLYGON_TTL_HOUR_MS`, `POLYGON_TTL_DAY_MS`
+- Прокси для обхода корпоративных ограничений:
+  - Глобальные: `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`
+  - Для Polygon рекомендуем исключение: `NO_PROXY=api.polygon.io`
+  - Для новостного провайдера отдельный прокси: `NEWS_PROXY_URL` (например, `socks5h://127.0.0.1:1080`)
+- NewsAPI:
+  - `NEWSAPI_ENABLED` — `true|false` для включения новостей
+  - `NEWSAPI_KEY` — ключ NewsAPI
+  - `NEWSAPI_LANGUAGE` — `en|ru` язык новостей
+  - `NEWSAPI_MAX_PER_SYMBOL` — ограничение кол-ва новостей на символ
+  - `NEWSAPI_TIMEOUT_MS` — таймаут запросов к NewsAPI, мс
 
 ## Аутентификация
 Все защищённые маршруты под префиксом `/api` требуют заголовок:
@@ -125,6 +141,10 @@ curl -H "x-api-key: your-super-secret-key" \
 }
 ```
 
+Примечания по новостям:
+- При `NEWSAPI_ENABLED=true` сервер дополнительно собирает дайджест новостей по каждому символу за указанный период и учитывает их при формировании `marketConditions` для ИИ.
+- Язык новостей управляется `NEWSAPI_LANGUAGE` (`en|ru`). Для нестабильных сетей можно указать отдельный прокси `NEWS_PROXY_URL`.
+
 ## Валидация и ошибки
 - Валидация параметров выполнена через `express-validator` и `utils/validation.validate`.
 - Ошибки Polygon:
@@ -142,12 +162,18 @@ setx NO_PROXY "localhost,127.0.0.1"
 ```
 Перезапустите терминал и сервер.
 
+Точечные прокси:
+- `GEMINI_PROXY_URL` — только для вызовов Gemini
+- `NEWS_PROXY_URL` — только для вызовов NewsAPI
+- Для Polygon наоборот рекомендовано обходить прокси: `NO_PROXY=api.polygon.io`
+
 ## Полезные скрипты
 - `npm run dev` — запуск сервера в dev-режиме
 - `npm run build` — сборка TypeScript в `dist/`
 - `npm start` — запуск собранного кода
 - `npm run prisma:generate` — генерация Prisma Client
 - `npm run prisma:migrate` — миграция схемы (создаст/обновит файл БД)
+- `npm run smoke:analysis` — локальный прогон сценария анализа периода (см. `scripts/smoke-analysis.ts`)
 
 ## Локальная БД (SQLite + Prisma)
 1. Установите зависимости: `npm install`
@@ -206,12 +232,26 @@ npm run prisma:generate
   - Возвращает: `maxDrawdown`, `maxDrawdownPct`, `points[]` (equity/ДД во времени)
 
 ## Структура
+- `src/index.ts` — инициализация Express, роутинг и middleware
+- `src/config/index.ts` — конфигурация из `.env`
+- `src/middleware/auth.middleware.ts` — защита API (заголовок `x-api-key`)
+- `src/middleware/error.middleware.ts` — централизованная обработка ошибок
+- `src/middleware/validation.middleware.ts` — валидация запросов
+- `src/routes/trading.routes.ts` — торговые маршруты (`/api/trades/*`)
+- `src/routes/db.routes.ts` — маршруты CRUD/аудита БД (`/api/db/*`)
+- `src/routes/metrics.routes.ts` — маршруты метрик (`/api/metrics/*`)
+- `src/controllers/trading.controller.ts` — OHLC, анализ периода, заглушки сделок/портфеля
+- `src/controllers/db.controller.ts` — CRUD по сделкам, аудит и история анализов
+- `src/controllers/metrics.controller.ts` — сводка, PnL weekly/daily, просадка
 - `src/services/polygon.service.ts` — интеграция Polygon (агрегаты, ретраи, кэш)
-- `src/services/gemini.service.ts` — вызовы Gemini
-- `src/controllers/trading.controller.ts` — контроллеры (OHLC, анализ)
-- `src/routes/trading.routes.ts` — маршруты
+- `src/services/gemini.service.ts` — вызовы Gemini (JSON‑приоритет, fallback)
+- `src/services/news.service.ts` — интеграция с NewsAPI и сбор дайджестов
+- `src/services/prisma.ts` — инициализация Prisma Client
 - `src/utils/symbol-mapper.ts` — маппинг символов в формат Polygon
-- `src/config/index.ts` — конфигурация
+- `src/utils/indicators.ts` — базовые индикаторы/сводки по свечам
+- `src/utils/validation.ts` — вспомогательные валидаторы
+- `src/types/*` — типы домена и API
 
 ## Лицензия
 ISC
+
