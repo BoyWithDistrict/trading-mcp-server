@@ -1,0 +1,133 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(uuid())
+  email     String?  @unique
+  name      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deletedAt DateTime?
+
+  trades      Trade[]
+  tradePlans  TradePlan[]
+  analyses    AIAnalysis[]
+  folders     Folder[]
+  screenshots Screenshot[]
+  auditLogs   AuditLog[]
+}
+
+model Trade {
+  id           String   @id @default(uuid())
+  userId       String
+  ticker       String
+  strategy     String?
+  entryTime    DateTime?
+  exitTime     DateTime?
+  direction    String? // 'buy' | 'sell'
+  entryPrice   Float?
+  stopLoss     Float?
+  takeProfit   Float?
+  lot          Float?
+  riskPercent  Float?
+  profit       Float?
+  emotion      String?
+  isPlanned    Boolean? @default(false)
+  planId       String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  deletedAt    DateTime?
+
+  user      User         @relation(fields: [userId], references: [id])
+  plan      TradePlan?   @relation(fields: [planId], references: [id])
+  analyses  AIAnalysis[]
+
+  @@index([userId, ticker])
+  @@index([userId, entryTime])
+  @@index([userId, exitTime])
+}
+
+model TradePlan {
+  id        String   @id @default(uuid())
+  userId    String
+  date      DateTime?
+  symbol    String?
+  direction String?
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deletedAt DateTime?
+
+  user   User    @relation(fields: [userId], references: [id])
+  trades Trade[]
+}
+
+model AIAnalysis {
+  id        String   @id @default(uuid())
+  userId    String
+  tradeId   String?
+  prompt    String?
+  response  String?  // можно хранить JSON как строку
+  model     String?
+  timestamp DateTime @default(now())
+  metadata  String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deletedAt DateTime?
+
+  user  User   @relation(fields: [userId], references: [id])
+  trade Trade? @relation(fields: [tradeId], references: [id])
+
+  @@index([userId, tradeId])
+  @@index([userId, timestamp])
+}
+
+model Folder {
+  id        String   @id @default(uuid())
+  userId    String
+  name      String
+  color     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deletedAt DateTime?
+
+  user       User        @relation(fields: [userId], references: [id])
+  screenshots Screenshot[]
+}
+
+model Screenshot {
+  id          String   @id @default(uuid())
+  userId      String
+  title       String?
+  description String?
+  folderId    String?
+  storageKey  String?
+  metadata    String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  deletedAt   DateTime?
+
+  user   User   @relation(fields: [userId], references: [id])
+  folder Folder? @relation(fields: [folderId], references: [id])
+}
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  userId     String
+  entityType String
+  entityId   String
+  action     String
+  before     String?
+  after      String?
+  timestamp  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, entityType, entityId])
+}
