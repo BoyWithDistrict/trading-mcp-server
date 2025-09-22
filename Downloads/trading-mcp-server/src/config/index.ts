@@ -64,6 +64,12 @@ const config = {
         backoffBaseMs: Number(process.env.POLYGON_BACKOFF_BASE_MS || 300),
       }
     },
+    finnhub: {
+      apiKey: process.env.FINNHUB_API_KEY || '',
+      timeoutMs: Number(process.env.FINNHUB_TIMEOUT_MS || 15000),
+      maxRetries: Number(process.env.FINNHUB_MAX_RETRIES || 2),
+      proxyUrl: process.env.FINNHUB_PROXY_URL || '',
+    },
     news: {
       newsApiKey: process.env.NEWSAPI_KEY || '',
       defaults: {

@@ -131,3 +131,107 @@ model AuditLog {
 
   @@index([userId, entityType, entityId])
 }
+
+// ========================
+// Macro Data (providers, series, observations with revisions)
+// ========================
+
+model MacroProvider {
+  id       String        @id @default(uuid())
+  name     String        @unique
+  baseUrl  String?
+  active   Boolean       @default(true)
+  series   MacroSeries[]
+}
+
+model MacroSeries {
+  id         String         @id @default(uuid())
+  providerId String
+  provider   MacroProvider  @relation(fields: [providerId], references: [id])
+  code       String
+  country    String?
+  name       String?
+  frequency  String?        // daily | weekly | monthly | quarterly
+  unit       String?        // %, index, etc.
+  decimals   Int?
+  active     Boolean        @default(true)
+
+  observations MacroObservation[]
+  latest       MacroLatest?
+
+  @@unique([providerId, code])
+  @@index([country])
+}
+
+model MacroObservation {
+  id           String       @id @default(uuid())
+  seriesId     String
+  series       MacroSeries  @relation(fields: [seriesId], references: [id])
+  date         DateTime     // дата, к которой относится наблюдение
+  value        Float
+  revisionSeq  Int          @default(0) // 0 = первичная публикация; >0 = пересмотры
+  revisionDate DateTime?
+  isLatest     Boolean      @default(true)
+  createdAt    DateTime     @default(now())
+
+  @@unique([seriesId, date, revisionSeq])
+  @@index([seriesId, date])
+}
+
+// Быстрый доступ к последней эффективной версии значения
+model MacroLatest {
+  seriesId    String   @id
+  series      MacroSeries @relation(fields: [seriesId], references: [id])
+  date        DateTime
+  value       Float
+  revisionSeq Int
+  updatedAt   DateTime     @updatedAt
+}
+
+// ========================
+// News (articles + per-symbol index)
+// ========================
+
+model NewsArticle {
+  id          String   @id @default(uuid())
+  provider    String
+  title       String
+  url         String   @unique
+  source      String?
+  publishedAt DateTime
+  language    String?
+  symbols     String?   // JSON-строка массива символов
+  countries   String?   // JSON-строка массива стран
+  topics      String?   // JSON-строка массива топиков
+  sentiment   Float?
+  createdAt   DateTime @default(now())
+
+  indexes NewsSymbolIndex[]
+}
+
+model NewsSymbolIndex {
+  id          String      @id @default(uuid())
+  symbol      String
+  articleId   String
+  article     NewsArticle @relation(fields: [articleId], references: [id])
+  publishedAt DateTime
+
+  @@index([symbol, publishedAt])
+}
+
+// ========================
+// Mapping helpers
+// ========================
+
+// Для связи символов с релевантными странами
+model SymbolCountry {
+  symbol    String @id
+  countries String?  // JSON-строка массива стран
+  updatedAt DateTime @updatedAt
+}
+
+// Для связи стран с валютами (US->USD, EU->EUR, UK->GBP)
+model CountryCurrency {
+  country String @id
+  currency String
+}

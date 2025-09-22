@@ -6,6 +6,7 @@ import { authenticate, requestLogger } from './middleware/auth.middleware';
 import tradingRoutes from './routes/trading.routes';
 import dbRoutes from './routes/db.routes';
 import metricsRoutes from './routes/metrics.routes';
+import adminRoutes from './routes/admin.routes';
 
 // Загружаем переменные окружения
 dotenv.config();
@@ -71,6 +72,7 @@ app.use('/api', authenticate);
 app.use('/api/trades', tradingRoutes);
 app.use('/api/db', dbRoutes);
 app.use('/api/metrics', metricsRoutes);
+app.use('/api/admin', adminRoutes);
 
 // Проверка работоспособности
 app.get('/api/health', (req, res) => {

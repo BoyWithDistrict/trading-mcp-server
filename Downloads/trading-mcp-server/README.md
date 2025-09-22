@@ -109,12 +109,23 @@ npm run build && npm start
   - Глобальные: `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`
   - Для Polygon рекомендуем исключение: `NO_PROXY=api.polygon.io`
   - Для новостного провайдера отдельный прокси: `NEWS_PROXY_URL` (например, `socks5h://127.0.0.1:1080`)
+ - FRED (макроданные США):
+  - `FRED_API_KEY` — ключ FRED (St. Louis Fed)
+  - `FRED_TIMEOUT_MS` — таймаут запросов к FRED, мс (по умолчанию 20000)
+  - `FRED_MAX_RETRIES` — количество ретраев при временных ошибках (по умолчанию 3)
+  - Рекомендуется добавить к `NO_PROXY`: `api.stlouisfed.org,stlouisfed.org` (чтобы ходить на FRED напрямую в обход VPN‑прокси)
+- Управление макроконтентом в промпте:
+  - `MACRO_MINUTE_USE_SUMMARY_ONLY` — `true|false` (по умолчанию `true`). Для таймфрейма `minute` в промпт передаётся только `macroSummary` без рядов, чтобы не засорять контекст для скальпинга.
+  - `MACRO_PROMPT_POINTS` — количество последних точек рядов для `hour/day` (по умолчанию 3). На ответ API также распространяется обрезка рядов.
 - NewsAPI:
   - `NEWSAPI_ENABLED` — `true|false` для включения новостей
   - `NEWSAPI_KEY` — ключ NewsAPI
   - `NEWSAPI_LANGUAGE` — `en|ru` язык новостей
   - `NEWSAPI_MAX_PER_SYMBOL` — ограничение кол-ва новостей на символ
   - `NEWSAPI_TIMEOUT_MS` — таймаут запросов к NewsAPI, мс
+  - `NEWS_CACHE_TTL_MS` — TTL in-memory кэша дайджеста по символам (по умолчанию 2700000 = 45 минут)
+  - `NEWSAPI_EXTRA_KEYWORDS` — дополнительные ключевые слова (через запятую) для расширенного поиска
+  - `NEWSAPI_MAX_KEYWORDS` — максимум ключевых слов в расширенном поиске (по умолчанию 12), чтобы не превысить лимит длины запроса
 
 ## Аутентификация
 Все защищённые маршруты под префиксом `/api` требуют заголовок:
@@ -222,7 +233,28 @@ curl -H "x-api-key: your-super-secret-key" \
       "symbols": ["EURUSD","XAUUSD","XTIUSD"],
       "period": { "from":"…","to":"…","timespan":"day" }
     },
-    "candles": { "EURUSD": [ … ], "XAUUSD": [ … ], "XTIUSD": [ … ] }
+    "candles": { "EURUSD": [ … ], "XAUUSD": [ … ], "XTIUSD": [ … ] },
+    "marketConditions": {
+      "timespan": "day",
+      "from": "…",
+      "to": "…",
+      "candles": {"EURUSD": [ … ]},
+      "marketIndicators": {"EURUSD": { "ema20": … }},
+      "news": {
+        "aggregated": { "EURUSD": [{"time":"…","source":"…","title":"…","url":"…"}] },
+        "byTrade": { "T1": [{"time":"…","title":"…"}] }
+      },
+      "macroEvents": {
+        "all": [{"time":"…","country":"US","event":"CPI","actual":"3.2%","forecast":"3.1%","previous":"3.3%","impact":"high"}],
+        "byDate": { "2025-09-02": [ {"event":"…"} ] },
+        "byTrade": { "T1": [ {"event":"…","impact":"high"} ] }
+      },
+      "macroData": {
+        "cpi": { "series": [{"time":"…","value":3.2}], "meta": {"country":"US","name":"CPI"} },
+        "gdp": { "series": [{"time":"…","value":2.1}] },
+        "policyRate": { "series": [{"time":"…","value":5.25}] }
+      }
+    }
   }
 }
 ```
@@ -230,6 +262,14 @@ curl -H "x-api-key: your-super-secret-key" \
 Примечания по новостям:
 - При `NEWSAPI_ENABLED=true` сервер дополнительно собирает дайджест новостей по каждому символу за указанный период и учитывает их при формировании `marketConditions` для ИИ.
 - Язык новостей управляется `NEWSAPI_LANGUAGE` (`en|ru`). Для нестабильных сетей можно указать отдельный прокси `NEWS_PROXY_URL`.
+ - Дайджест новостей агрегируется на английском языке. Привязка к сделкам осуществляется по окну ±1 день от `entryTime/exitTime`.
+
+Примечания по макроданным (FRED):
+- Используются ряды США из FRED: `CPIAUCSL` (CPI), `GDPC1` (Real GDP, кварт.), `FEDFUNDS` (Effective Fed Funds), `UNRATE` (безработица).
+- Для корректного заполнения рядов загрузка выполняется на расширенном окне (~13 месяцев), а в ответе API и промпте ряды обрезаются до последних N точек (по умолчанию N=3).
+- Для таймфрейма `minute` в промпт передаётся только `macroSummary` (последние значения и простые производные), а ряды исключаются — это управляется `MACRO_MINUTE_USE_SUMMARY_ONLY`.
+- В ответе API присутствует индикатор `marketConditions.macroInPrompt` со значением `summary-only` (для minute) или `full` (для hour/day).
+- Админ‑обновление макроданных: `POST /api/admin/macro/refresh?country=US&months=13` — перетягивает ряды из FRED за указанное окно и сохраняет в БД.
 
 ## Валидация и ошибки
 - Валидация параметров выполнена через `express-validator` и `utils/validation.validate`.
@@ -238,6 +278,10 @@ curl -H "x-api-key: your-super-secret-key" \
   - 429/5xx → прокидывается соответствующий статус
   - Прочие — 502/соответствующий код
 - Общие ошибки логируются через `winston`.
+
+### Траблшутинг NewsAPI
+- Ошибка `HTTP 400 queryTooLong`: сократите пул ключевых слов через `NEWSAPI_MAX_KEYWORDS` (по умолчанию 12) или уменьшите `NEWSAPI_EXTRA_KEYWORDS`.
+- Сетевые ошибки `fetch failed`: проверьте доступ к `newsapi.org` и переменную `NEWS_PROXY_URL` (можно временно оставить пустой, чтобы ходить напрямую).
 
 ## Прокси/VPN
 Если используете VPN/корпоративную сеть и браузер видит Polygon, а сервер — нет, укажите прокси для Node.js:

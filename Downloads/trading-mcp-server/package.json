@@ -13,7 +13,13 @@
     "format": "prettier --write \"src/**/*.ts\"",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
-    "smoke:analysis": "ts-node scripts/smoke-analysis.ts"
+    "prisma:seed": "prisma db seed",
+    "smoke:analysis": "ts-node scripts/smoke-analysis.ts",
+    "smoke:finnhub": "ts-node scripts/test-finnhub.ts",
+    "smoke:fred": "ts-node scripts/test-fred.ts"
+  },
+  "prisma": {
+    "seed": "ts-node prisma/seed.ts"
   },
   "keywords": [
     "trading",

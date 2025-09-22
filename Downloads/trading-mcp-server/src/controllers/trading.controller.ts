@@ -10,6 +10,9 @@ import { summarizeIndicators, getIndicatorsSnapshot } from '../utils/indicators'
 import { coerceTextToV2 } from '../utils/ai-postprocess';
 import newsService from '../services/news.service';
 import { getPersonalizationWeights, makePhraseNormalizer, truncateContext } from '../config/personalization';
+import logger from '../utils/logger';
+import { persistMacroData, loadMacroDataFromDb, hasAnyData } from '../services/macro-cache.service';
+import fredService from '../services/fred.service';
 
 const MAX_RANGE_DAYS: Record<Timespan, number> = {
   minute: 7,
@@ -189,15 +192,7 @@ export class TradingController extends BaseController {
     const workers = Array.from({ length: Math.min(CONCURRENCY, symbols.length) }, () => runWorker());
     await Promise.all(workers);
 
-    // Получаем новости по списку символов (если ключ задан)
-    let news: Record<string, any[]> | undefined = undefined;
-    try {
-      const normSymbols = symbols.map(normalizeJournalSymbol);
-      const digest = await newsService.getNewsDigest(normSymbols, from, to);
-      news = digest;
-    } catch {}
-
-    // Обогащаем сделки индикаторами на момент entry/exit
+    // Обогащаем сделки индикаторами на момент entry/exit (нужно далее для привязки макро/новостей к сделкам)
     const trades = Array.isArray(body.trades) ? body.trades : [];
     const enrichedTrades = trades.map((t: any) => {
       try {
@@ -213,8 +208,189 @@ export class TradingController extends BaseController {
       return { ...t };
     });
 
-    // Формируем marketConditions для Gemini: свечи + агрегаты индикаторов + новости
-    const marketConditions = { timespan, from, to, candles: candlesBySymbol, marketIndicators: indicatorsBySymbol, news };
+    // Получаем новости по списку символов (если ключ задан)
+    let news: Record<string, any[]> | undefined = undefined;
+    try {
+      const normSymbols = symbols.map(normalizeJournalSymbol);
+      const digest = await newsService.getNewsDigest(normSymbols, from, to);
+      news = digest;
+    } catch {}
+
+    // Макро: экономический календарь (high/medium) и ключевые метрики за период
+    // Примечание: макросерии (CPI/UNRATE/FEDFUNDS/GDP) публикуются ежемесячно/ежеквартально.
+    // Чтобы не получать пустые ряды при коротком периоде, расширяем окно запроса для макроданных.
+    let macroEventsAll: Array<{ time: string; country?: string; event: string; actual?: any; forecast?: any; previous?: any; impact?: string; }> = [];
+    let macroData: any = {};
+    // Economic calendar: Finnhub отключен. Пока оставляем пустым (MVP).
+    try {
+      // Read-through: сначала пробуем прочитать из БД на расширенном окне
+      const country = 'US';
+      const desiredKeys = ['cpi', 'gdp', 'policyRate', 'unemployment', 'pmi'] as const;
+      const fromD = new Date(from);
+      const toD = new Date(to);
+      const extendedFrom = new Date(fromD.getTime() - 400 * 24 * 60 * 60 * 1000).toISOString(); // ~13 месяцев назад
+      const extendedTo = toD.toISOString();
+      const dbMacro = await loadMacroDataFromDb(country, extendedFrom, extendedTo, desiredKeys as any);
+      if (hasAnyData(dbMacro as any)) {
+        macroData = { US: dbMacro };
+      } else {
+        // Fallback: вызываем FRED (US) на расширенном окне и сохраняем в БД
+        try { logger.info('AnalyzePeriod: calling FRED.getMacroDataUS', { from: extendedFrom, to: extendedTo }); } catch {}
+        const fetched = await fredService.getMacroDataUS(extendedFrom, extendedTo);
+        try {
+          const sizes = Object.fromEntries(Object.entries(fetched || {}).map(([k,v]: any) => [k, Array.isArray(v?.series) ? v.series.length : 0]));
+          logger.info('AnalyzePeriod: FRED.getMacroDataUS returned', { sizes });
+        } catch {}
+        try { await persistMacroData(fetched as any); } catch (e) { logger.warn('persistMacroData failed (non-fatal)', { error: String(e) }); }
+        macroData = { US: fetched };
+      }
+    } catch {}
+
+    // Группировка macroEvents по дате и привязка к сделкам
+    const macroEventsByDate: Record<string, any[]> = {};
+    try {
+      for (const ev of macroEventsAll) {
+        const d = new Date(ev.time);
+        const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+        if (!macroEventsByDate[key]) macroEventsByDate[key] = [];
+        macroEventsByDate[key].push(ev);
+      }
+    } catch {}
+
+    const macroEventsByTrade: Record<string, any[]> = {};
+    const newsByTrade: Record<string, any[]> = {};
+    try {
+      const dayMs = 24 * 60 * 60 * 1000;
+      const aggregatedNews = news || {};
+      for (const t of enrichedTrades) {
+        const id = (t && t.id != null) ? String(t.id) : undefined;
+        if (!id) continue;
+        const entryMs = t?.entryTime ? new Date(t.entryTime).getTime() : (t?.timestamp ? new Date(t.timestamp).getTime() : NaN);
+        const exitMs = t?.exitTime ? new Date(t.exitTime).getTime() : entryMs;
+        if (!isFinite(entryMs)) continue;
+        const fromMs = entryMs - dayMs;
+        const toMs = (isFinite(exitMs) ? exitMs : entryMs) + dayMs;
+        // macro events filter
+        macroEventsByTrade[id] = (macroEventsAll || []).filter((ev) => {
+          const ts = new Date(ev.time).getTime();
+          return ts >= fromMs && ts <= toMs;
+        });
+        // news filter by time window across all related symbols for the trade
+        const sym = t?.symbol ? normalizeJournalSymbol(String(t.symbol)) : undefined;
+        const newsLists: any[] = [];
+        if (sym && aggregatedNews[sym]) newsLists.push(...aggregatedNews[sym]);
+        // Также попробуем новости по всем символам периода, если нужно расширить охват
+        // const allLists = Object.values(aggregatedNews) as any[];
+        newsByTrade[id] = newsLists.filter((n: any) => {
+          const ts = new Date(n.time).getTime();
+          return isFinite(ts) && ts >= fromMs && ts <= toMs;
+        });
+
+      }
+    } catch {}
+
+    // enrichedTrades уже рассчитаны выше
+
+    // Подготовим компактный макро-контекст: урезанные ряды и сводку
+    let macroDataTrimmed: any = undefined;
+    let macroSummary: any = undefined;
+    try {
+      const promptPoints = Math.max(1, Number(process.env.MACRO_PROMPT_POINTS || 3));
+      const trimSeries = (s?: { series?: any[]; meta?: any }) => {
+        if (!s || !Array.isArray(s.series)) return s;
+        const n = s.series.length;
+        const cut = s.series.slice(Math.max(0, n - promptPoints));
+        return { ...s, series: cut };
+      };
+      const latestOf = (s?: { series?: Array<{ time: string; value: number }> }) => {
+        if (!s || !Array.isArray(s.series) || s.series.length === 0) return undefined;
+        return s.series[s.series.length - 1];
+      };
+      const prevOf = (s?: { series?: Array<{ time: string; value: number }> }) => {
+        if (!s || !Array.isArray(s.series) || s.series.length < 2) return undefined;
+        return s.series[s.series.length - 2];
+      };
+      const yoyOf = (s?: { series?: Array<{ time: string; value: number }> }) => {
+        if (!s || !Array.isArray(s.series) || s.series.length < 13) return undefined;
+        const latest = s.series[s.series.length - 1];
+        const ago = s.series[s.series.length - 13];
+        if (!latest || !ago) return undefined;
+        const abs = latest.value - ago.value;
+        const pct = ago.value !== 0 ? (abs / ago.value) * 100 : undefined;
+        return { abs, pct };
+      };
+
+      const usAll = (macroData && macroData.US) ? macroData.US : macroData;
+      const usTrim = usAll ? {
+        cpi: trimSeries(usAll.cpi),
+        gdp: trimSeries(usAll.gdp),
+        policyRate: trimSeries(usAll.policyRate),
+        unemployment: trimSeries(usAll.unemployment),
+        pmi: trimSeries(usAll.pmi),
+      } : undefined;
+      if (usAll && (usAll.cpi || usAll.unemployment || usAll.policyRate || usAll.gdp)) {
+        const cpiLast = latestOf(usAll.cpi);
+        const cpiYoY = yoyOf(usAll.cpi);
+        const unLast = latestOf(usAll.unemployment);
+        const unPrev = prevOf(usAll.unemployment);
+        const rateLast = latestOf(usAll.policyRate);
+        const ratePrev = prevOf(usAll.policyRate);
+        const gdpLast = latestOf(usAll.gdp);
+        const gdpPrev = prevOf(usAll.gdp);
+        macroSummary = {
+          US: {
+            cpi: cpiLast ? { date: cpiLast.time, value: cpiLast.value, yoyPct: cpiYoY?.pct } : undefined,
+            unemployment: unLast ? { date: unLast.time, value: unLast.value, delta: (unPrev ? unLast.value - unPrev.value : undefined) } : undefined,
+            policyRate: rateLast ? { date: rateLast.time, value: rateLast.value, delta: (ratePrev ? rateLast.value - ratePrev.value : undefined) } : undefined,
+            gdp: gdpLast ? { date: gdpLast.time, value: gdpLast.value, delta: (gdpPrev ? gdpLast.value - gdpPrev.value : undefined) } : undefined,
+          },
+        };
+      }
+      macroDataTrimmed = usTrim ? { US: usTrim } : macroData;
+    } catch {}
+
+    // Формируем marketConditions для API ответа: свечи + агрегаты индикаторов + новости + макро
+    const marketConditions = {
+      timespan,
+      from,
+      to,
+      candles: candlesBySymbol,
+      marketIndicators: indicatorsBySymbol,
+      news: news ? { aggregated: news, byTrade: newsByTrade } : undefined,
+      macroEvents: { all: macroEventsAll, byDate: macroEventsByDate, byTrade: macroEventsByTrade },
+      macroData: macroDataTrimmed || macroData,
+      macroSummary,
+      macroInPrompt: undefined as any,
+    };
+
+    // Подготовим marketConditionsForAI: для minute используем только macroSummary (по умолчанию)
+    const minuteSummaryOnly = String(process.env.MACRO_MINUTE_USE_SUMMARY_ONLY || 'true').toLowerCase() === 'true';
+    const marketConditionsForAI = (() => {
+      if (timespan === 'minute' && minuteSummaryOnly) {
+        const mc = { ...marketConditions } as any;
+        // Уберём макроряды чтобы не засорять контекст ИИ на скальпинге
+        mc.macroData = undefined;
+        mc.macroInPrompt = 'summary-only';
+        return mc;
+      }
+      const mc = { ...marketConditions } as any;
+      mc.macroInPrompt = 'full';
+      return mc;
+    })();
+
+    // Логирование объёмов макро/новостей для быстрой диагностики
+    try {
+      const macroAll = Array.isArray(macroEventsAll) ? macroEventsAll.length : 0;
+      const macroDataKeys = Object.keys(macroData || {}).filter(k => !!(macroData as any)[k]).length;
+      const newsSyms = news ? Object.keys(news).length : 0;
+      const newsByTradeCount = Object.keys(newsByTrade || {}).length;
+      logger.info('AnalyzePeriod context snapshot', {
+        macroEventsAll: macroAll,
+        macroDataSeries: macroDataKeys,
+        newsSymbols: newsSyms,
+        newsByTrade: newsByTradeCount,
+      });
+    } catch {}
 
     // Подготовим trades (обогащённые) для промпта
     // Если пришёл ровно один trade с id — сохраним связь в AIAnalysis.tradeId
@@ -343,7 +519,7 @@ export class TradingController extends BaseController {
     let ai: any | undefined;
     let aiMeta: any | undefined;
     try {
-      const aiResult = await geminiService.analyzeTradingDataJSON(enrichedTrades as any, marketConditions, lang, schema, personalContext);
+      const aiResult = await geminiService.analyzeTradingDataJSON(enrichedTrades as any, marketConditionsForAI, lang, schema, personalContext);
       if (aiResult?.ai) {
         ai = aiResult.ai;
         textSummary = ai.summary || '';
@@ -374,7 +550,7 @@ export class TradingController extends BaseController {
     const avgProfit = tradesCount ? totalProfit / tradesCount : 0;
 
     const structuredInsights = {
-      symbols: symbols.map(normalizeJournalSymbol),
+      symbols: symbols.map((s) => normalizeJournalSymbol(String(s))),
       period: { from, to, timespan },
       metrics: { tradesCount, wins, winRate, totalProfit, avgProfit },
     };
@@ -382,30 +558,15 @@ export class TradingController extends BaseController {
     const response: any = {
       textSummary,
       structuredInsights,
-      ai,
+      ai: ai || {},
       aiLang: lang,
     };
-    if (body.includeRaw) {
+
+    if ((body as any)?.includeRaw) {
       response.candles = candlesBySymbol;
     }
-
-    // Сохраняем результат анализа в БД (AIAnalysis)
-    try {
-      const userId = await getOrCreateDemoUserId();
-      const record = await prisma.aIAnalysis.create({
-        data: {
-          userId,
-          tradeId: singleTradeId, // если ровно одна сделка — связываем
-          prompt: 'analyzePeriod',
-          response: JSON.stringify(response),
-          model: textSummary && textSummary !== 'ИИ-анализ временно недоступен. Ниже приведены структурированные данные для ручного разбора.' ? 'gemini' : 'none',
-          metadata: JSON.stringify({ from, to, timespan, symbols: structuredInsights.symbols, aiMeta }),
-        },
-        select: { id: true },
-      });
-      response.analysisId = record.id;
-    } catch (e) {
-      // Лог ошибки сохранения не прерывает ответ клиенту
+    if ((body as any)?.includeContext) {
+      response.marketConditions = marketConditions;
     }
 
     return this.handleSuccess(res, response);
